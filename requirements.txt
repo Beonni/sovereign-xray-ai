@@ -5,3 +5,4 @@ numpy<2
 torch
 torchvision
 torchxrayvision
+supabase>=2,<3
