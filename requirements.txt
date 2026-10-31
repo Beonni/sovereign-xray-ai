@@ -1,2 +1,7 @@
+
 streamlit>=1.40,<2
 Pillow>=10,<13
+numpy<2
+torch
+torchvision
+torchxrayvision
