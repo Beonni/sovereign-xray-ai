@@ -832,7 +832,7 @@ elif page == "Doctor Review" and role == "doctor":
             use_container_width=True
         )
 
-        with st.form("review"):
+        with st.form("doctor_review_form_v5"):
             decision = st.radio(
                 "Review decision",
                 [
