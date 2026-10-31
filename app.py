@@ -1,21 +1,18 @@
 
+"""Sovereign X-ray AI v5 — teaching/demo application only."""
 import hashlib
 import hmac
 import io
 import json
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import streamlit as st
 import torch
 from PIL import Image, UnidentifiedImageError
 from supabase import create_client
-
-
-# ==========================================
-# 1. SYSTEM CONFIGURATION
-# ==========================================
 
 st.set_page_config(
     page_title="Sovereign X-ray AI",
@@ -27,32 +24,32 @@ MODEL_ID = "densenet121-res224-all"
 MAX_FILE_SIZE = 10 * 1024 * 1024
 
 
-def now():
+# ==========================================
+# 1. UTILITIES
+# ==========================================
+
+def timestamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def new_id():
+def uid():
     return str(uuid.uuid4())
 
 
-# ==========================================
-# 2. SESSION MANAGEMENT
-# ==========================================
-
-def initialize():
-    defaults = {
-        "user": None,
-        "role": None,
-        "xray_image": None,
-        "image_hash": None,
-        "image_id": None,
-        "results": None,
-        "analysis_id": None,
-        "review": None,
-        "audit_logs": [],
-        "last_audit_error": None,
-        "failed_logins": 0,
-    }
+def init_state():
+    defaults = dict(
+        user=None,
+        role=None,
+        xray_image=None,
+        image_hash=None,
+        image_id=None,
+        results=None,
+        analysis_id=None,
+        review=None,
+        audit_logs=[],
+        last_audit_error=None,
+        failed_logins=0
+    )
 
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -70,21 +67,21 @@ def clear_case():
         "image_id",
         "results",
         "analysis_id",
-        "review",
+        "review"
     ):
         st.session_state[key] = None
 
 
 # ==========================================
-# 3. SUPABASE CONNECTION
+# 2. SUPABASE CONNECTION
 # ==========================================
 
 @st.cache_resource(show_spinner=False)
-def supabase_client(url, key):
+def connect_db(url, key):
     return create_client(url, key)
 
 
-def get_db():
+def db():
     url = str(
         st.secrets.get("SUPABASE_URL", "")
     ).strip()
@@ -95,117 +92,101 @@ def get_db():
 
     if not url.startswith("https://") or not key:
         raise RuntimeError(
-            "Supabase Secrets configuration "
-            "is missing or invalid."
+            "Configure SUPABASE_URL and "
+            "SUPABASE_SECRET_KEY in Streamlit Secrets"
         )
 
-    return supabase_client(url, key)
+    return connect_db(url, key)
 
 
 # ==========================================
-# 4. PERSISTENT AUDIT LOG
+# 3. PERSISTENT AUDIT LOG
 # ==========================================
 
 def audit(action, details=None):
-    """
-    Save an audit event to Supabase.
-    If saving fails, keep a local unsaved
-    record and report the failure.
-    """
-
     details = details or {}
 
-    event = {
-        "event_id": new_id(),
-        "created_at": now(),
-        "actor": (
-            st.session_state.user or "anonymous"
-        ),
-        "role": (
-            st.session_state.role or "anonymous"
-        ),
-        "action": action,
-        "image_id": details.get("image_id"),
-        "analysis_id": details.get("analysis_id"),
-        "details": details,
-    }
+    record = dict(
+        event_id=uid(),
+        created_at=timestamp(),
+        actor=st.session_state.user or "anonymous",
+        role=st.session_state.role or "anonymous",
+        action=action,
+        image_id=details.get("image_id"),
+        analysis_id=details.get("analysis_id"),
+        details=details
+    )
 
     try:
-        get_db().table(
-            "audit_logs"
-        ).insert(event).execute()
-
-    except Exception:
-        st.session_state.last_audit_error = (
-            "Could not save event to Supabase. "
-            "Check configuration and Cloud Logs."
-        )
+        db().table("audit_logs").insert(
+            record
+        ).execute()
 
         st.session_state.audit_logs.append({
-            **event,
+            **record,
+            "sync_status": "SAVED"
+        })
+
+        st.session_state.last_audit_error = None
+        return True
+
+    except Exception:
+        st.session_state.audit_logs.append({
+            **record,
             "sync_status": "NOT_SAVED"
         })
 
+        st.session_state.last_audit_error = (
+            "Audit event NOT saved in Supabase. "
+            "Check database connection and permissions."
+        )
+
         return False
-
-    st.session_state.last_audit_error = None
-
-    st.session_state.audit_logs.append({
-        **event,
-        "sync_status": "SAVED"
-    })
-
-    return True
 
 
 # ==========================================
-# 5. AUTHENTICATION
+# 4. AUTHENTICATION
 # ==========================================
 
-def verify_login(username, password):
-    if username not in ("doctor", "admin"):
-        return False
-
-    if not password:
+def authenticate(username, password):
+    if username not in ("doctor", "admin") or not password:
         return False
 
     try:
-        data = st.secrets[username]
+        entry = st.secrets[username]
 
         if not hmac.compare_digest(
-            str(data["username"]),
+            str(entry["username"]),
             username
         ):
             return False
 
         salt = bytes.fromhex(
-            str(data["salt"])
+            str(entry["salt"])
         )
 
         expected = bytes.fromhex(
-            str(data["password_hash"])
+            str(entry["password_hash"])
         )
 
-        iterations = int(
-            data["iterations"]
-        )
+        iterations = int(entry["iterations"])
 
         if (
-            iterations < 100_000
-            or not salt
+            iterations < 100000
             or len(expected) != 32
+            or not salt
         ):
             return False
 
-        actual = hashlib.pbkdf2_hmac(
+        candidate = hashlib.pbkdf2_hmac(
             "sha256",
-            password.encode("utf-8"),
+            password.encode(),
             salt,
             iterations
         )
 
         return hmac.compare_digest(
-            actual,
+            candidate,
             expected
         )
 
@@ -220,7 +201,6 @@ def verify_login(username, password):
 
 def logout():
     audit("LOGOUT")
-
     clear_case()
 
     st.session_state.user = None
@@ -230,50 +210,38 @@ def logout():
 
 
 # ==========================================
-# 6. IMAGE VALIDATION
+# 5. IMAGE VALIDATION
 # ==========================================
 
-def read_image(raw):
-    if not raw or len(raw) > MAX_FILE_SIZE:
+def read_image(data):
+    if not data or len(data) > MAX_FILE_SIZE:
         raise ValueError(
-            "File must be nonempty "
-            "and at most 10 MB."
+            "Image must be nonempty and 10MB or smaller"
         )
 
-    with Image.open(
-        io.BytesIO(raw)
-    ) as source:
-
-        if source.format not in (
-            "PNG",
-            "JPEG"
-        ):
+    with Image.open(io.BytesIO(data)) as source:
+        if source.format not in ("JPEG", "PNG"):
             raise ValueError(
-                "Only PNG/JPEG supported."
+                "Only PNG or JPEG accepted"
             )
 
         if max(source.size) > 5000:
-            raise ValueError(
-                "Image dimensions "
-                "exceed the limit."
-            )
+            raise ValueError("Image is too large")
 
-        source.load()
+        result = source.convert("L")
+        result.load()
 
-        image = source.convert("L")
-        image.load()
-
-    return image
+    return result
 
 
 # ==========================================
-# 7. AI MODEL
+# 6. AI MODEL & WEIGHTS
 # ==========================================
 
 @st.cache_resource(
-    show_spinner="Loading AI X-ray model..."
+    show_spinner="Loading X-ray model..."
 )
-def load_model():
+def loaded_model():
     import torchxrayvision as xrv
 
     model = xrv.models.DenseNet(
@@ -281,115 +249,205 @@ def load_model():
     )
 
     model.eval()
-
     return model
 
 
-def predict(image):
+@st.cache_resource(
+    show_spinner="Locating pretrained model weights..."
+)
+def weights_path():
     import torchxrayvision as xrv
 
-    data = np.asarray(
+    return Path(
+        xrv.models.get_weights(MODEL_ID)
+    )
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as file:
+        for part in iter(
+            lambda: file.read(1024 * 1024),
+            b""
+        ):
+            digest.update(part)
+
+    return digest.hexdigest()
+
+
+def actual_fingerprint():
+    path = weights_path()
+
+    if not path.is_file():
+        raise RuntimeError(
+            "Pretrained weights file is missing"
+        )
+
+    return sha256_file(path)
+
+
+# ==========================================
+# 7. MODEL REGISTRY
+# ==========================================
+
+def registry():
+    result = (
+        db()
+        .table("model_registry")
+        .select("*")
+        .eq("model_id", MODEL_ID)
+        .limit(1)
+        .execute()
+    )
+
+    if not result.data:
+        raise RuntimeError(
+            "Model not registered in "
+            "Supabase model_registry"
+        )
+
+    return result.data[0]
+
+
+def change_registry(payload):
+    result = (
+        db()
+        .table("model_registry")
+        .update(payload)
+        .eq("model_id", MODEL_ID)
+        .execute()
+    )
+
+    if not result.data:
+        raise RuntimeError(
+            "Model registry update "
+            "did not return a record"
+        )
+
+    return result.data[0]
+
+
+def checked_model():
+    item = registry()
+
+    if item.get("status") != "APPROVED":
+        raise PermissionError(
+            "Model not approved. "
+            "Ask Admin to inspect and approve it."
+        )
+
+    approved_hash = item.get("weights_sha256")
+
+    if not approved_hash:
+        raise PermissionError(
+            "Model does not have "
+            "a registered SHA-256 hash"
+        )
+
+    path = weights_path()
+    before = sha256_file(path)
+
+    if not hmac.compare_digest(
+        before,
+        approved_hash
+    ):
+        raise PermissionError(
+            "Weight SHA-256 mismatch. "
+            "Inference blocked."
+        )
+
+    model = loaded_model()
+
+    after = sha256_file(path)
+
+    if not hmac.compare_digest(
+        after,
+        approved_hash
+    ):
+        raise PermissionError(
+            "Weights changed during loading. "
+            "Inference blocked."
+        )
+
+    return model, before
+
+
+# ==========================================
+# 8. AI INFERENCE
+# ==========================================
+
+def predict(image, model):
+    import torchxrayvision as xrv
+
+    img = np.asarray(
         image.convert("L"),
         dtype=np.float32
     )
 
-    data = xrv.datasets.normalize(
-        data,
-        255
+    img = xrv.datasets.normalize(
+        img, 255
     )[None, :, :]
 
-    data = xrv.datasets.XRayCenterCrop()(data)
-
-    data = xrv.datasets.XRayResizer(224)(data)
+    img = xrv.datasets.XRayCenterCrop()(img)
+    img = xrv.datasets.XRayResizer(224)(img)
 
     tensor = torch.from_numpy(
-        np.ascontiguousarray(data)
+        np.ascontiguousarray(img)
     ).unsqueeze(0).float()
-
-    model = load_model()
 
     with torch.inference_mode():
         output = model(tensor)[0].cpu().numpy()
 
-    results = [
+    scores = [
         {
             "finding": label,
-            "score": float(score)
+            "score": float(value)
         }
-        for label, score in zip(
+        for label, value in zip(
             model.pathologies,
             output
         )
-        if np.isfinite(score)
+        if np.isfinite(value)
     ]
 
     return sorted(
-        results,
-        key=lambda item: item["score"],
+        scores,
+        key=lambda x: x["score"],
         reverse=True
     )
 
 
 # ==========================================
-# 8. INITIALIZE APPLICATION
+# 9. APPLICATION INITIALIZATION
 # ==========================================
 
-initialize()
+init_state()
 
 st.title(
     "🏥 Sovereign AI Medical Imaging System"
 )
 
 st.caption(
-    "基於主權 AI 之胸部 X 光影像輔助分析系統"
+    "基於主權 AI 之胸部 X 光影像輔助分析系統 "
+    "· Model Governance v5"
 )
 
 st.warning(
-    "Research and teaching demo only. "
-    "Not for clinical diagnosis. "
-    "Upload only public, "
-    "de-identified sample images."
+    "Research demonstration only; "
+    "not for clinical diagnosis. "
+    "Use public, de-identified test images only."
 )
 
 
 # ==========================================
-# 9. LOGIN PAGE
+# 10. LOGIN PAGE
 # ==========================================
 
 if st.session_state.user is None:
+    st.subheader("Sign in – 身分驗證")
 
-    st.subheader(
-        "Sign in – 身分驗證"
-    )
-
-    try:
-        configured = all(
-            all(
-                field in st.secrets[role]
-                for field in (
-                    "username",
-                    "salt",
-                    "password_hash",
-                    "iterations"
-                )
-            )
-            for role in ("doctor", "admin")
-        )
-
-    except (
-        KeyError,
-        FileNotFoundError
-    ):
-        configured = False
-
-    if not configured:
-        st.error(
-            "Missing Doctor/Admin settings "
-            "in Streamlit Secrets."
-        )
-        st.stop()
-
-    with st.form("login_form"):
+    with st.form("login"):
         username = st.text_input(
             "Username"
         ).strip().lower()
@@ -405,15 +463,12 @@ if st.session_state.user is None:
         )
 
     if submitted:
-
-        if verify_login(username, password):
-
+        if authenticate(username, password):
             st.session_state.user = username
             st.session_state.role = username
             st.session_state.failed_logins = 0
 
             clear_case()
-
             audit("LOGIN_SUCCESS")
 
             st.rerun()
@@ -423,34 +478,25 @@ if st.session_state.user is None:
 
             audit(
                 "LOGIN_FAILED",
-                {
-                    "attempted_username": username[:50]
-                }
+                {"attempted_username": username[:50]}
             )
 
             st.error(
-                "Incorrect username or password."
+                "Incorrect username or password"
             )
-
-            if st.session_state.failed_logins >= 5:
-                st.warning(
-                    "Demo authentication has no "
-                    "robust account lockout "
-                    "or rate limiting."
-                )
 
     st.stop()
 
 
 # ==========================================
-# 10. ROLE-BASED NAVIGATION
+# 11. ROLE-BASED NAVIGATION
 # ==========================================
 
 role = st.session_state.role
 
-st.sidebar.subheader(
-    "Control Panel"
-)
+if role not in ("doctor", "admin"):
+    st.error("Unauthorized role")
+    st.stop()
 
 st.sidebar.write(
     f"Signed in: **{st.session_state.user}** "
@@ -471,26 +517,16 @@ if role == "doctor":
         "Model Control"
     ]
 
-elif role == "admin":
+else:
     pages = [
         "Dashboard",
         "Model Control",
         "Audit Log"
     ]
 
-else:
-    st.error(
-        "Unauthorized role"
-    )
-    st.stop()
-
 page = st.sidebar.radio(
     "Navigation",
     pages
-)
-
-st.sidebar.caption(
-    f"Model: {MODEL_ID}"
 )
 
 if st.session_state.last_audit_error:
@@ -500,116 +536,102 @@ if st.session_state.last_audit_error:
 
 
 # ==========================================
-# 11. DASHBOARD
+# 12. DASHBOARD
 # ==========================================
 
 if page == "Dashboard":
+    st.header("System Dashboard")
 
-    st.header("Dashboard")
+    a, b, c = st.columns(3)
 
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric(
-        "Role",
-        role.title()
-    )
-
-    col2.metric(
-        "AI model",
-        "DenseNet121"
-    )
-
-    col3.metric(
-        "Local session events",
+    a.metric("Role", role.title())
+    b.metric("Model", "DenseNet121")
+    c.metric(
+        "Session events",
         len(st.session_state.audit_logs)
     )
 
-    st.write(
-        "✅ Doctor/Admin sign-in "
-        "and role-gated pages"
-    )
-
-    st.write(
-        "✅ X-ray AI inference "
-        "and human review workflow"
-    )
-
     try:
-        get_db().table(
+        db().table(
             "audit_logs"
         ).select(
             "event_id"
         ).limit(1).execute()
 
+        model_item = registry()
+
         st.success(
             "Supabase Audit Log connection: available"
         )
 
-    except Exception:
+        st.write(
+            "Model approval status:",
+            model_item.get("status", "UNKNOWN")
+        )
+
+        st.write(
+            "Registered model SHA-256:",
+            model_item.get("weights_sha256")
+            or "Not registered"
+        )
+
+    except Exception as exc:
         st.error(
-            "Supabase Audit Log connection: unavailable. "
-            "Check Secrets, SQL permissions, and logs."
+            "Database/Model Registry unavailable: "
+            f"{type(exc).__name__}"
         )
 
     st.info(
-        "The host manages physical infrastructure. "
-        "Database access uses a high-privilege "
-        "server secret. This is a teaching prototype, "
-        "not a compliant clinical system."
+        "Third-party cloud infrastructure; "
+        "model approval is a prototype control, "
+        "not clinical certification."
     )
 
 
 # ==========================================
-# 12. UPLOAD X-RAY
+# 13. UPLOAD X-RAY
 # ==========================================
 
-elif (
-    page == "Upload X-ray"
-    and role == "doctor"
-):
-
+elif page == "Upload X-ray" and role == "doctor":
     st.header("Upload X-ray")
 
     st.info(
-        "Use only public, already de-identified "
-        "PNG/JPEG images. This app does NOT remove "
-        "text burned into image pixels."
+        "Only public, already de-identified "
+        "PNG/JPEG images. Embedded text in "
+        "pixels is NOT removed."
     )
 
     uploaded = st.file_uploader(
-        "PNG/JPEG image",
+        "Choose X-ray image",
         type=["png", "jpg", "jpeg"]
     )
 
     if uploaded is not None:
-
         try:
             raw = uploaded.getvalue()
-
             image = read_image(raw)
 
-            file_hash = hashlib.sha256(
+            digest = hashlib.sha256(
                 raw
             ).hexdigest()
 
             if (
-                file_hash != st.session_state.image_hash
+                digest != st.session_state.image_hash
                 or not st.session_state.image_id
                 or st.session_state.xray_image is None
             ):
-
                 clear_case()
 
                 st.session_state.xray_image = image
-                st.session_state.image_hash = file_hash
-                st.session_state.image_id = new_id()
+                st.session_state.image_hash = digest
+                st.session_state.image_id = uid()
 
                 audit(
                     "IMAGE_UPLOADED",
                     {
                         "image_id":
                             st.session_state.image_id,
-                        "image_sha256": file_hash,
+                        "image_sha256": digest,
                         "size_bytes": len(raw)
                     }
                 )
@@ -619,9 +641,7 @@ elif (
                 width=380
             )
 
-            st.success(
-                "Image ready for AI analysis"
-            )
+            st.success("Image ready")
 
             st.write(
                 "Image ID:",
@@ -639,40 +659,33 @@ elif (
             )
 
     elif st.session_state.xray_image is not None:
-
         st.image(
             st.session_state.xray_image,
-            width=340
+            width=350
         )
 
         st.write(
-            "Current Image ID:",
+            "Current image ID:",
             st.session_state.image_id
         )
 
 
 # ==========================================
-# 13. AI ANALYSIS
+# 14. AI ANALYSIS
 # ==========================================
 
-elif (
-    page == "AI Analysis"
-    and role == "doctor"
-):
-
-    st.header(
-        "AI Chest X-ray Analysis"
-    )
+elif page == "AI Analysis" and role == "doctor":
+    st.header("AI Chest X-ray Analysis")
 
     if st.session_state.xray_image is None:
         st.info(
-            "Please upload an image first."
+            "Please upload an image first"
         )
 
     else:
         st.image(
             st.session_state.xray_image,
-            width=340
+            width=350
         )
 
         st.write(
@@ -680,26 +693,50 @@ elif (
             st.session_state.image_id
         )
 
+        try:
+            state = registry()
+
+            st.write(
+                "Model status:",
+                state.get("status")
+            )
+
+            ready = (
+                state.get("status") == "APPROVED"
+                and bool(state.get("weights_sha256"))
+            )
+
+        except Exception:
+            ready = False
+            st.error(
+                "Cannot verify model approval "
+                "in Supabase"
+            )
+
+        if not ready:
+            st.warning(
+                "Inference disabled until Admin "
+                "verifies and approves the checkpoint"
+            )
+
         if st.button(
             "Analyze X-ray with AI",
-            type="primary"
+            type="primary",
+            disabled=not ready
         ):
-
             try:
                 with st.spinner(
-                    "Running model inference..."
+                    "Verifying model integrity "
+                    "and running AI..."
                 ):
+                    model, checkpoint_hash = checked_model()
+
                     scores = predict(
-                        st.session_state.xray_image
+                        st.session_state.xray_image,
+                        model
                     )
 
-                if not st.session_state.image_id:
-                    raise ValueError(
-                        "Missing image ID. "
-                        "Re-upload the image."
-                    )
-
-                analysis_id = new_id()
+                analysis_id = uid()
 
                 st.session_state.results = scores
                 st.session_state.analysis_id = analysis_id
@@ -712,38 +749,34 @@ elif (
                             st.session_state.image_id,
                         "analysis_id": analysis_id,
                         "model": MODEL_ID,
+                        "weights_sha256": checkpoint_hash,
                         "scores": scores
                     }
                 )
 
                 if saved:
                     st.success(
-                        "AI analysis completed "
-                        "and event saved to Supabase."
+                        "AI inference completed; "
+                        "audit saved to Supabase"
                     )
-
                 else:
                     st.warning(
-                        "AI analysis completed, "
-                        "but the audit event was "
-                        "NOT saved to Supabase."
+                        "Inference completed, "
+                        "but audit was NOT saved "
+                        "to Supabase"
                     )
 
             except Exception as exc:
                 st.error(
-                    "AI inference failed"
+                    f"Inference blocked or failed: {exc}"
                 )
-                st.exception(exc)
 
         if st.session_state.results is not None:
-
-            st.subheader(
-                "Model Output Scores"
-            )
+            st.subheader("Model output scores")
 
             st.caption(
-                "Scores are NOT calibrated disease "
-                "probabilities or medical diagnoses."
+                "Scores are not calibrated disease "
+                "probabilities or diagnoses."
             )
 
             st.write(
@@ -759,33 +792,28 @@ elif (
 
 
 # ==========================================
-# 14. DOCTOR REVIEW
+# 15. DOCTOR REVIEW
 # ==========================================
 
-elif (
-    page == "Doctor Review"
-    and role == "doctor"
-):
-
+elif page == "Doctor Review" and role == "doctor":
     st.header(
         "Doctor Review – 醫師審查"
     )
 
     st.caption(
-        "The 'doctor' account is a demo role; "
-        "medical qualifications are not verified."
+        "Doctor is a demo role; medical "
+        "qualifications have not been verified."
     )
 
     if st.session_state.results is None:
         st.info(
-            "Complete AI Analysis first."
+            "Complete AI Analysis first"
         )
 
     else:
-
         st.image(
             st.session_state.xray_image,
-            width=340
+            width=350
         )
 
         st.write(
@@ -804,8 +832,7 @@ elif (
             use_container_width=True
         )
 
-        with st.form("review_form"):
-
+        with st.form("review"):
             decision = st.radio(
                 "Review decision",
                 [
@@ -816,8 +843,7 @@ elif (
             )
 
             notes = st.text_area(
-                "Review notes / 修改原因 "
-                "(demo text only)"
+                "Review notes / 修改原因"
             )
 
             submitted = st.form_submit_button(
@@ -826,65 +852,47 @@ elif (
             )
 
         if submitted:
-
             if not notes.strip():
-                st.error(
-                    "Review notes are required."
-                )
+                st.error("Review notes required")
 
             elif (
                 not st.session_state.image_id
                 or not st.session_state.analysis_id
             ):
                 st.error(
-                    "Missing Image ID or Analysis ID. "
-                    "Please upload and analyze again."
+                    "Missing image or analysis ID"
                 )
 
             else:
-
-                review = {
-                    "review_id": new_id(),
-                    "image_id":
-                        st.session_state.image_id,
-                    "analysis_id":
-                        st.session_state.analysis_id,
-                    "reviewer":
-                        st.session_state.user,
+                item = {
+                    "review_id": uid(),
+                    "image_id": st.session_state.image_id,
+                    "analysis_id": st.session_state.analysis_id,
+                    "reviewer": st.session_state.user,
                     "decision": decision,
                     "notes": notes.strip(),
                     "model": MODEL_ID,
-                    "timestamp": now()
+                    "timestamp": timestamp()
                 }
 
-                st.session_state.review = review
+                st.session_state.review = item
 
-                saved = audit(
+                if audit(
                     "DOCTOR_REVIEW_COMPLETED",
-                    review
-                )
-
-                if saved:
+                    item
+                ):
                     st.success(
-                        "Review and audit event "
-                        "saved to Supabase."
+                        "Review audit saved to Supabase"
                     )
-
                 else:
                     st.warning(
-                        "Review saved in this session only; "
-                        "Supabase audit insert FAILED."
+                        "Review exists only in session; "
+                        "Supabase save failed"
                     )
 
         if st.session_state.review is not None:
-
-            st.subheader(
-                "Latest Review"
-            )
-
-            st.json(
-                st.session_state.review
-            )
+            st.subheader("Latest Review")
+            st.json(st.session_state.review)
 
             st.download_button(
                 "Download Review JSON",
@@ -899,66 +907,240 @@ elif (
 
 
 # ==========================================
-# 15. MODEL CONTROL
+# 16. MODEL CONTROL
 # ==========================================
 
 elif page == "Model Control":
-
     st.header(
         "Model Control – 模型管理"
     )
 
-    st.write(
-        "Model:",
-        MODEL_ID
-    )
-
+    st.write("Model:", MODEL_ID)
     st.write(
         "Framework: PyTorch / TorchXRayVision"
     )
 
-    st.write(
-        "Runtime: Streamlit Community Cloud CPU"
+    st.caption(
+        "SHA-256 identifies checkpoint file bytes, "
+        "not clinical performance certification."
     )
 
-    if role == "admin":
-        st.warning(
-            "Admin view only. Model weight verification, "
-            "version approvals and model switching "
-            "are not implemented."
+    try:
+        item = registry()
+
+        st.write(
+            "Registry status:",
+            item.get("status")
         )
+
+        st.write(
+            "Stored SHA-256:",
+            item.get("weights_sha256")
+            or "Not registered"
+        )
+
+        st.write(
+            "Approved by:",
+            item.get("approved_by") or "—"
+        )
+
+        st.write(
+            "Approved at:",
+            item.get("approved_at") or "—"
+        )
+
+    except Exception as exc:
+        st.error(
+            f"Model registry unavailable: {exc}"
+        )
+        st.stop()
+
+    if role == "admin":
+
+        # Step A: Load model and compute hash
+        if st.button(
+            "Load model and compute checkpoint SHA-256"
+        ):
+            try:
+                with st.spinner(
+                    "Loading checkpoint and hashing file..."
+                ):
+                    loaded_model()
+                    actual = actual_fingerprint()
+
+                st.session_state.current_weights_hash = actual
+
+                st.success(
+                    "Checkpoint fingerprint calculated"
+                )
+
+            except Exception as exc:
+                st.error(
+                    f"Checkpoint unavailable: {exc}"
+                )
+
+        current_hash = st.session_state.get(
+            "current_weights_hash"
+        )
+
+        if current_hash:
+            st.write(
+                "Current checkpoint SHA-256:",
+                current_hash
+            )
+
+            stored = item.get("weights_sha256")
+
+            st.write(
+                "Matches registered hash:",
+                bool(
+                    stored and hmac.compare_digest(
+                        stored,
+                        current_hash
+                    )
+                )
+            )
+
+            # Step B: Register actual hash
+            if item.get("status") != "APPROVED":
+
+                if st.button(
+                    "Register current checkpoint SHA-256"
+                ):
+                    try:
+                        change_registry({
+                            "weights_sha256": current_hash,
+                            "status": "PENDING",
+                            "approved_by": None,
+                            "approved_at": None
+                        })
+
+                        audit(
+                            "MODEL_HASH_REGISTERED",
+                            {
+                                "model": MODEL_ID,
+                                "weights_sha256": current_hash
+                            }
+                        )
+
+                        st.success(
+                            "Fingerprint registered as PENDING"
+                        )
+
+                        st.rerun()
+
+                    except Exception as exc:
+                        st.error(
+                            f"Registration failed: {exc}"
+                        )
+
+        # Step C: Approve model
+        if item.get("status") != "APPROVED":
+
+            if st.button(
+                "Approve verified model",
+                type="primary"
+            ):
+                try:
+                    with st.spinner(
+                        "Rechecking checkpoint SHA-256..."
+                    ):
+                        loaded_model()
+                        measured = actual_fingerprint()
+
+                    approved = item.get("weights_sha256")
+
+                    if (
+                        not approved
+                        or not hmac.compare_digest(
+                            approved,
+                            measured
+                        )
+                    ):
+                        raise ValueError(
+                            "Current checkpoint SHA-256 "
+                            "does not match registered hash"
+                        )
+
+                    change_registry({
+                        "status": "APPROVED",
+                        "approved_by": st.session_state.user,
+                        "approved_at": timestamp()
+                    })
+
+                    audit(
+                        "MODEL_APPROVED",
+                        {
+                            "model": MODEL_ID,
+                            "weights_sha256": measured
+                        }
+                    )
+
+                    st.success(
+                        "Model approved for demonstration"
+                    )
+
+                    st.rerun()
+
+                except Exception as exc:
+                    st.error(
+                        f"Approval denied: {exc}"
+                    )
+
+        # Step D: Revoke approval
+        else:
+
+            if st.button("Revoke model approval"):
+                try:
+                    change_registry({
+                        "status": "REJECTED",
+                        "approved_by": None,
+                        "approved_at": None
+                    })
+
+                    audit(
+                        "MODEL_APPROVAL_REVOKED",
+                        {"model": MODEL_ID}
+                    )
+
+                    st.success(
+                        "Approval revoked; "
+                        "future inference will be blocked"
+                    )
+
+                    st.rerun()
+
+                except Exception as exc:
+                    st.error(
+                        f"Revocation failed: {exc}"
+                    )
 
     else:
         st.info(
-            "Doctor: read-only model information."
+            "Doctor has read-only model information"
         )
 
 
 # ==========================================
-# 16. PERSISTENT AUDIT LOG
+# 17. PERSISTENT AUDIT LOG
 # ==========================================
 
-elif (
-    page == "Audit Log"
-    and role == "admin"
-):
-
+elif page == "Audit Log" and role == "admin":
     st.header(
         "Persistent Audit Log – 稽核紀錄"
     )
 
     st.caption(
-        "Reads saved events from Supabase "
-        "(across browser sessions), "
-        "not from Streamlit Session State."
+        "Supabase shared events (last 500), "
+        "not session-only logs"
     )
 
-    if st.button("Refresh Audit Logs"):
+    if st.button("Refresh logs"):
         st.rerun()
 
     try:
-        result = (
-            get_db()
+        response = (
+            db()
             .table("audit_logs")
             .select(
                 "event_id,created_at,actor,role,"
@@ -972,7 +1154,7 @@ elif (
             .execute()
         )
 
-        rows = result.data or []
+        rows = response.data or []
 
         st.metric(
             "Persisted events (latest 500)",
@@ -980,33 +1162,28 @@ elif (
         )
 
         if rows:
-
-            summary = []
-
-            for event in rows:
-                summary.append({
-                    "created_at": event.get(
-                        "created_at", ""
+            summary = [
+                {
+                    "created_at": r.get("created_at", ""),
+                    "actor": r.get(
+                        "actor",
+                        "legacy/unknown"
                     ),
-                    "actor": event.get(
-                        "actor", "legacy/unknown"
+                    "role": r.get(
+                        "role",
+                        "unknown"
                     ),
-                    "role": event.get(
-                        "role", "unknown"
+                    "action": r.get(
+                        "action",
+                        "UNKNOWN"
                     ),
-                    "action": event.get(
-                        "action", "UNKNOWN"
-                    ),
-                    "image_id": event.get(
-                        "image_id"
-                    ),
-                    "analysis_id": event.get(
-                        "analysis_id"
-                    ),
-                    "event_id": event.get(
-                        "event_id"
+                    "event_id": r.get(
+                        "event_id",
+                        ""
                     )
-                })
+                }
+                for r in rows
+            ]
 
             st.dataframe(
                 summary,
@@ -1014,23 +1191,18 @@ elif (
                 use_container_width=True
             )
 
-            st.subheader(
-                "Event Details"
-            )
-
-            for event in rows:
-
+            for row in rows:
                 title = (
-                    f"{event.get('created_at', '')} | "
-                    f"{event.get('action', 'UNKNOWN')}"
+                    f"{row.get('created_at', '')} | "
+                    f"{row.get('action', 'UNKNOWN')}"
                 )
 
                 with st.expander(title):
-                    st.json(event)
+                    st.json(row)
 
             st.download_button(
-                "Download Persistent Audit Log (JSON)",
-                data=json.dumps(
+                "Download Audit Log JSON",
+                json.dumps(
                     rows,
                     indent=2,
                     ensure_ascii=False,
@@ -1042,14 +1214,11 @@ elif (
 
         else:
             st.info(
-                "No saved events yet. "
-                "Log in as Doctor and complete "
-                "an upload, analysis and review."
+                "No persisted events yet"
             )
 
-    except Exception:
+    except Exception as exc:
         st.error(
-            "Failed to read Supabase audit_logs. "
-            "Check API key, permissions, database "
-            "status and Cloud Logs."
+            "Could not read Supabase audit log: "
+            f"{type(exc).__name__}"
         )
