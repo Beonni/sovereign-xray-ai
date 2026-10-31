@@ -37,7 +37,7 @@ def new_id():
 # 2. SESSION MANAGEMENT
 # ==========================================
 
-def initialize():
+def init_state():
     defaults = {
         "user": None,
         "role": None,
@@ -54,7 +54,8 @@ def initialize():
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = (
-                [] if isinstance(value, list) else value
+                value.copy() if isinstance(value, list)
+                else value
             )
 
 
@@ -71,18 +72,20 @@ def clear_case():
 
 
 # ==========================================
-# 3. AUDIT LOG FUNCTIONS
+# 3. AUDIT LOG
 # ==========================================
 
 def audit(action, details=None):
-    st.session_state.audit_logs.append({
+    event = {
         "event_id": new_id(),
         "timestamp": now(),
         "actor": st.session_state.user or "anonymous",
         "role": st.session_state.role or "anonymous",
         "action": action,
         "details": details or {},
-    })
+    }
+
+    st.session_state.audit_logs.append(event)
 
 
 # ==========================================
@@ -94,18 +97,24 @@ def verify_login(username, password):
         return False
 
     try:
-        entry = st.secrets[username]
+        data = st.secrets[username]
 
         if not hmac.compare_digest(
-            str(entry["username"]), username
+            str(data["username"]), username
         ):
             return False
 
-        salt = bytes.fromhex(entry["salt"])
-        expected = bytes.fromhex(entry["password_hash"])
-        iterations = int(entry["iterations"])
+        salt = bytes.fromhex(str(data["salt"]))
+        expected = bytes.fromhex(
+            str(data["password_hash"])
+        )
+        iterations = int(data["iterations"])
 
-        if iterations < 100000:
+        if (
+            iterations < 100_000
+            or not salt
+            or len(expected) != 32
+        ):
             return False
 
         actual = hashlib.pbkdf2_hmac(
@@ -117,7 +126,12 @@ def verify_login(username, password):
 
         return hmac.compare_digest(actual, expected)
 
-    except (KeyError, ValueError, TypeError):
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        FileNotFoundError
+    ):
         return False
 
 
@@ -141,23 +155,21 @@ def read_image(raw):
             "Image must be nonempty and at most 10 MB."
         )
 
-    with Image.open(io.BytesIO(raw)) as original:
-        if original.format not in ("PNG", "JPEG"):
+    with Image.open(io.BytesIO(raw)) as source:
+        if source.format not in ("JPEG", "PNG"):
             raise ValueError(
-                "Only PNG/JPEG images are supported."
+                "Only JPEG and PNG are supported."
             )
 
         if (
-            original.width > 5000
-            or original.height > 5000
+            source.width > 5000
+            or source.height > 5000
         ):
             raise ValueError(
                 "Image dimensions exceed 5000 pixels."
             )
 
-        # Rebuild image from pixels.
-        # Original EXIF metadata is not retained.
-        image = original.convert("L")
+        image = source.convert("L")
         image.load()
 
     return image
@@ -168,7 +180,7 @@ def read_image(raw):
 # ==========================================
 
 @st.cache_resource(
-    show_spinner="Loading pretrained X-ray model..."
+    show_spinner="Loading X-ray AI model..."
 )
 def load_model():
     import torchxrayvision as xrv
@@ -178,26 +190,26 @@ def load_model():
     )
 
     model.eval()
-
     return model
 
 
 def predict(image):
     import torchxrayvision as xrv
 
-    data = np.asarray(
+    pixels = np.asarray(
         image.convert("L"),
         dtype=np.float32
     )
 
-    data = xrv.datasets.normalize(data, 255)
-    data = data[None, :, :]
+    pixels = xrv.datasets.normalize(
+        pixels, 255
+    )[None, :, :]
 
-    data = xrv.datasets.XRayCenterCrop()(data)
-    data = xrv.datasets.XRayResizer(224)(data)
+    pixels = xrv.datasets.XRayCenterCrop()(pixels)
+    pixels = xrv.datasets.XRayResizer(224)(pixels)
 
     tensor = torch.from_numpy(
-        np.ascontiguousarray(data)
+        np.ascontiguousarray(pixels)
     ).unsqueeze(0).float()
 
     model = load_model()
@@ -211,24 +223,23 @@ def predict(image):
             "score": float(score)
         }
         for label, score in zip(
-            model.pathologies,
-            output
+            model.pathologies, output
         )
         if np.isfinite(score)
     ]
 
     return sorted(
         scores,
-        key=lambda item: item["score"],
+        key=lambda x: x["score"],
         reverse=True
     )
 
 
 # ==========================================
-# 7. INITIALIZE APPLICATION
+# 7. INITIALIZE
 # ==========================================
 
-initialize()
+init_state()
 
 st.title(
     "🏥 Sovereign AI Medical Imaging System"
@@ -239,18 +250,17 @@ st.caption(
 )
 
 st.warning(
-    "For educational demonstration only. "
-    "Not for clinical use. "
+    "Educational demonstration only. "
+    "Not for clinical diagnosis. "
     "Use only public, de-identified test images."
 )
 
 
 # ==========================================
-# 8. LOGIN PAGE
+# 8. LOGIN
 # ==========================================
 
 if st.session_state.user is None:
-
     st.subheader("Sign in – 身分驗證")
 
     try:
@@ -272,8 +282,9 @@ if st.session_state.user is None:
 
     if not configured:
         st.error(
-            "Account configuration is missing. "
-            "Check Streamlit App settings → Secrets."
+            "Missing account settings. "
+            "Check Streamlit Cloud → "
+            "App settings → Secrets."
         )
         st.stop()
 
@@ -293,15 +304,12 @@ if st.session_state.user is None:
         )
 
     if submitted:
-
         if verify_login(username, password):
-
             st.session_state.user = username
             st.session_state.role = username
             st.session_state.failed_logins = 0
 
             clear_case()
-
             audit("LOGIN_SUCCESS")
 
             st.rerun()
@@ -311,9 +319,7 @@ if st.session_state.user is None:
 
             audit(
                 "LOGIN_FAILED",
-                {
-                    "attempted_username": username
-                }
+                {"attempted_username": username}
             )
 
             st.error(
@@ -322,9 +328,9 @@ if st.session_state.user is None:
 
             if st.session_state.failed_logins >= 5:
                 st.warning(
-                    "Multiple failed attempts. "
-                    "This demo does not provide "
-                    "production-grade rate limiting."
+                    "Repeated failures. This demo "
+                    "does not implement production-grade "
+                    "rate limiting."
                 )
 
     st.stop()
@@ -339,7 +345,7 @@ role = st.session_state.role
 st.sidebar.subheader("Control Panel")
 
 st.sidebar.write(
-    f"Signed in as **{st.session_state.user}** "
+    f"Logged in: **{st.session_state.user}** "
     f"({role})"
 )
 
@@ -378,60 +384,52 @@ st.sidebar.caption(
 # ==========================================
 
 if page == "Dashboard":
-
     st.header("System Dashboard")
 
     a, b, c = st.columns(3)
 
-    a.metric(
-        "Role",
-        role.title()
-    )
-
-    b.metric(
-        "Model",
-        "DenseNet121"
-    )
+    a.metric("Role", role.title())
+    b.metric("AI Model", "DenseNet121")
 
     c.metric(
-        "Session audit events",
+        "Session Audit Events",
         len(st.session_state.audit_logs)
     )
 
-    st.subheader("Sovereign AI Controls")
+    st.subheader("Sovereign AI Status")
 
     st.write(
-        "✅ Real AI inference (Doctor only)"
+        "✅ AI inference in the deployed app (Doctor)"
     )
 
     st.write(
-        "✅ Password-hash sign-in and "
-        "role-gated pages (demo)"
+        "✅ Role-gated pages and password-hash "
+        "sign-in (demo)"
     )
 
     st.write(
-        "✅ Doctor review and session audit trail"
+        "✅ Human review with session-only Audit Log"
     )
 
     st.write(
-        "🟡 Persistent multi-user audit logging: "
-        "not yet implemented"
-    )
-
-    st.write(
-        "🟡 Verified model weights and controlled "
-        "deployment: not yet implemented"
-    )
-
-    st.write(
-        "🟡 DICOM/pixel de-identification: "
+        "🟡 Persistent audit database: "
         "not implemented"
     )
 
+    st.write(
+        "🟡 Model integrity checking: "
+        "not implemented"
+    )
+
+    st.write(
+        "🟡 DICOM / burned-in patient information "
+        "removal: not implemented"
+    )
+
     st.info(
-        "Cloud infrastructure is managed by "
-        "the hosting provider. "
-        "This is not full infrastructure sovereignty."
+        "Cloud hardware is operated by a third "
+        "party; full infrastructure sovereignty "
+        "is not claimed."
     )
 
 
@@ -440,39 +438,36 @@ if page == "Dashboard":
 # ==========================================
 
 elif page == "Upload X-ray" and role == "doctor":
-
     st.header("Upload X-ray")
 
     st.info(
-        "Only upload public, already de-identified "
-        "teaching images. No patient records."
+        "Upload public, already de-identified "
+        "X-ray images only."
     )
 
     uploaded = st.file_uploader(
-        "PNG or JPEG",
+        "PNG/JPEG image",
         type=["png", "jpg", "jpeg"]
     )
 
     if uploaded is not None:
-
         try:
             raw = uploaded.getvalue()
             image = read_image(raw)
 
-            image_hash = hashlib.sha256(
+            new_hash = hashlib.sha256(
                 raw
             ).hexdigest()
 
             if (
-                image_hash != st.session_state.image_hash
+                new_hash != st.session_state.image_hash
                 or not st.session_state.image_id
                 or st.session_state.xray_image is None
             ):
-
                 clear_case()
 
                 st.session_state.xray_image = image
-                st.session_state.image_hash = image_hash
+                st.session_state.image_hash = new_hash
                 st.session_state.image_id = new_id()
 
                 audit(
@@ -480,7 +475,7 @@ elif page == "Upload X-ray" and role == "doctor":
                     {
                         "image_id":
                             st.session_state.image_id,
-                        "sha256": image_hash,
+                        "image_sha256": new_hash,
                         "size_bytes": len(raw)
                     }
                 )
@@ -505,20 +500,18 @@ elif page == "Upload X-ray" and role == "doctor":
             ValueError,
             Image.DecompressionBombError
         ) as exc:
-
             st.error(
                 f"Invalid image: {exc}"
             )
 
     elif st.session_state.xray_image is not None:
-
         st.image(
             st.session_state.xray_image,
             width=340
         )
 
         st.write(
-            "Current image ID:",
+            "Current Image ID:",
             st.session_state.image_id
         )
 
@@ -528,16 +521,14 @@ elif page == "Upload X-ray" and role == "doctor":
 # ==========================================
 
 elif page == "AI Analysis" and role == "doctor":
-
-    st.header("AI Analysis")
+    st.header("AI Chest X-ray Analysis")
 
     if st.session_state.xray_image is None:
         st.info(
-            "Upload an X-ray first."
+            "Upload an X-ray image first."
         )
 
     else:
-
         st.image(
             st.session_state.xray_image,
             width=340
@@ -548,15 +539,28 @@ elif page == "AI Analysis" and role == "doctor":
             st.session_state.image_id
         )
 
+        st.write(
+            "Model:",
+            MODEL_ID
+        )
+
         if st.button(
             "Analyze X-ray with AI",
             type="primary"
         ):
-
             try:
-                scores = predict(
-                    st.session_state.xray_image
-                )
+                with st.spinner(
+                    "Running AI inference..."
+                ):
+                    scores = predict(
+                        st.session_state.xray_image
+                    )
+
+                if not st.session_state.image_id:
+                    raise ValueError(
+                        "Image ID missing. "
+                        "Upload the image again."
+                    )
 
                 analysis_id = new_id()
 
@@ -581,20 +585,18 @@ elif page == "AI Analysis" and role == "doctor":
 
             except Exception as exc:
                 st.error(
-                    "Inference failed. "
-                    "See the application logs."
+                    "AI inference failed."
                 )
                 st.exception(exc)
 
         if st.session_state.results is not None:
-
             st.subheader(
-                "Model Output Scores"
+                "AI Model Output Scores"
             )
 
             st.caption(
-                "Scores are not calibrated disease "
-                "probabilities or clinical diagnoses."
+                "These scores are not calibrated "
+                "disease probabilities or diagnoses."
             )
 
             st.write(
@@ -614,24 +616,21 @@ elif page == "AI Analysis" and role == "doctor":
 # ==========================================
 
 elif page == "Doctor Review" and role == "doctor":
-
     st.header(
         "Doctor Review – 醫師審查"
     )
 
     st.caption(
-        "Authenticated demo role; this account "
-        "does not establish medical credentials."
+        "Demo role only. No professional medical "
+        "credentials are verified."
     )
 
     if st.session_state.results is None:
-
         st.info(
             "Complete AI Analysis first."
         )
 
     else:
-
         st.image(
             st.session_state.xray_image,
             width=340
@@ -653,8 +652,7 @@ elif page == "Doctor Review" and role == "doctor":
             use_container_width=True
         )
 
-        with st.form("review_form"):
-
+        with st.form("doctor_review_form"):
             decision = st.radio(
                 "Review decision",
                 [
@@ -674,23 +672,28 @@ elif page == "Doctor Review" and role == "doctor":
             )
 
         if submitted:
-
             if not notes.strip():
-
                 st.error(
-                    "Review notes are required."
+                    "Please enter review notes."
+                )
+
+            elif (
+                not st.session_state.image_id
+                or not st.session_state.analysis_id
+            ):
+                st.error(
+                    "Missing image/analysis ID; "
+                    "re-upload and analyze again."
                 )
 
             else:
-
                 record = {
                     "review_id": new_id(),
                     "image_id":
                         st.session_state.image_id,
                     "analysis_id":
                         st.session_state.analysis_id,
-                    "reviewer":
-                        st.session_state.user,
+                    "reviewer": st.session_state.user,
                     "decision": decision,
                     "notes": notes.strip(),
                     "model": MODEL_ID,
@@ -705,11 +708,11 @@ elif page == "Doctor Review" and role == "doctor":
                 )
 
                 st.success(
-                    "Review recorded for this session."
+                    "Review successfully recorded "
+                    "for this session."
                 )
 
         if st.session_state.review is not None:
-
             st.subheader(
                 "Latest Review"
             )
@@ -720,10 +723,10 @@ elif page == "Doctor Review" and role == "doctor":
 
             st.download_button(
                 "Download Review JSON",
-                json.dumps(
+                data=json.dumps(
                     st.session_state.review,
-                    indent=2,
-                    ensure_ascii=False
+                    ensure_ascii=False,
+                    indent=2
                 ),
                 file_name="doctor_review.json",
                 mime="application/json"
@@ -735,13 +738,12 @@ elif page == "Doctor Review" and role == "doctor":
 # ==========================================
 
 elif page == "Model Control":
-
     st.header(
         "Model Control – 模型管理"
     )
 
     st.write(
-        "Model ID:",
+        "Model:",
         MODEL_ID
     )
 
@@ -754,39 +756,34 @@ elif page == "Model Control":
     )
 
     if role == "admin":
-
         st.success(
-            "Admin has access to the model "
-            "information page."
+            "Admin role: model information access."
         )
 
         st.warning(
-            "Model activation, approval and weight "
-            "checksum verification are not yet implemented."
+            "Model activation, approval, and weight "
+            "SHA-256 verification are not implemented."
         )
 
     else:
-
         st.info(
-            "Read-only model information. "
-            "Admin manages deployment."
+            "Doctor role: read-only model information."
         )
 
 
 # ==========================================
-# 15. AUDIT LOG
+# 15. AUDIT LOG - FIX KEYERROR
 # ==========================================
 
 elif page == "Audit Log" and role == "admin":
-
     st.header(
         "Audit Log – 稽核紀錄"
     )
 
     st.warning(
-        "Demo only: these logs are stored in "
-        "the current browser session, NOT shared "
-        "across users or persisted."
+        "Demo only. Logs belong to this Streamlit "
+        "session, are not shared across users, "
+        "and are not persisted."
     )
 
     logs = st.session_state.audit_logs
@@ -797,32 +794,52 @@ elif page == "Audit Log" and role == "admin":
     )
 
     if logs:
+        # FIX: Read legacy events safely.
+        # Older records may lack actor or role.
+
+        rows = []
+
+        for item in reversed(logs):
+            rows.append({
+                "timestamp": item.get(
+                    "timestamp", ""
+                ),
+                "actor": item.get(
+                    "actor", "legacy/unknown"
+                ),
+                "role": item.get(
+                    "role", "unknown"
+                ),
+                "action": item.get(
+                    "action", "UNKNOWN"
+                ),
+                "event_id": item.get(
+                    "event_id", ""
+                )
+            })
 
         st.dataframe(
-            [
-                {
-                    "timestamp": item["timestamp"],
-                    "actor": item["actor"],
-                    "action": item["action"],
-                    "event_id": item["event_id"]
-                }
-                for item in reversed(logs)
-            ],
+            rows,
             hide_index=True,
             use_container_width=True
         )
 
-        for event in reversed(logs):
+        st.subheader(
+            "Event Details"
+        )
 
-            with st.expander(
-                f"{event['timestamp']} | "
-                f"{event['action']}"
-            ):
-                st.json(event)
+        for item in reversed(logs):
+            label = (
+                f"{item.get('timestamp', '')} | "
+                f"{item.get('action', 'UNKNOWN')}"
+            )
+
+            with st.expander(label):
+                st.json(item)
 
         st.download_button(
             "Download Audit Log (JSON)",
-            json.dumps(
+            data=json.dumps(
                 logs,
                 indent=2,
                 ensure_ascii=False
@@ -832,9 +849,8 @@ elif page == "Audit Log" and role == "admin":
         )
 
     else:
-
         st.info(
             "No events in this session. "
-            "Doctor events from a separate login "
+            "Doctor events in other sessions "
             "are not visible here."
         )
