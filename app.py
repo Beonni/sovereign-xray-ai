@@ -10,7 +10,7 @@ import io
 from datetime import datetime, timezone
 
 # ==========================================
-# 1. SYSTEM CONFIGURATION
+# 1. CONFIGURATION
 # ==========================================
 
 st.set_page_config(
@@ -26,7 +26,7 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 # 2. SESSION STATE
 # ==========================================
 
-defaults = {
+DEFAULTS = {
     "xray_image": None,
     "image_hash": None,
     "image_id": None,
@@ -36,23 +36,30 @@ defaults = {
     "audit_logs": [],
 }
 
-for key, value in defaults.items():
+for key, value in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = (
             [] if isinstance(value, list) else value
         )
 
-# ==========================================
-# 3. AUDIT LOG FUNCTIONS
-# ==========================================
 
 def utc_now():
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
+
+def new_id():
+    return str(uuid.uuid4())
+
+
+# ==========================================
+# 3. AUDIT LOG
+# ==========================================
 
 def add_audit_log(action, details):
     event = {
-        "event_id": str(uuid.uuid4()),
+        "event_id": new_id(),
         "timestamp": utc_now(),
         "action": action,
         "details": details
@@ -63,7 +70,42 @@ def add_audit_log(action, details):
 
 
 # ==========================================
-# 4. AI MODEL
+# 4. IMAGE VALIDATION
+# ==========================================
+
+def validate_image(raw):
+    if not raw:
+        raise ValueError("Image file is empty.")
+
+    if len(raw) > MAX_FILE_SIZE:
+        raise ValueError(
+            "Maximum image size is 10 MB."
+        )
+
+    with Image.open(io.BytesIO(raw)) as source:
+        if source.format not in ("PNG", "JPEG"):
+            raise ValueError(
+                "Only PNG and JPEG images are supported."
+            )
+
+        if (
+            source.width > 5000
+            or source.height > 5000
+        ):
+            raise ValueError(
+                "Image dimensions exceed the limit."
+            )
+
+        # Decode pixels into a new grayscale image.
+        # Original metadata is not stored in session.
+        image = source.convert("L")
+        image.load()
+
+    return image
+
+
+# ==========================================
+# 5. AI MODEL
 # ==========================================
 
 @st.cache_resource(
@@ -83,19 +125,14 @@ def load_model():
 def predict_xray(image):
     import torchxrayvision as xrv
 
-    # Convert image to grayscale
     img = np.asarray(
         image.convert("L"),
         dtype=np.float32
     )
 
-    # Normalize to TorchXRayVision range
     img = xrv.datasets.normalize(img, 255)
-
-    # Add channel dimension
     img = img[None, :, :]
 
-    # Preprocessing
     img = xrv.datasets.XRayCenterCrop()(img)
     img = xrv.datasets.XRayResizer(224)(img)
 
@@ -108,17 +145,17 @@ def predict_xray(image):
     with torch.inference_mode():
         outputs = model(tensor)[0].cpu().numpy()
 
-    results = [
-        {
-            "finding": name,
-            "score": float(score)
-        }
-        for name, score in zip(
-            model.pathologies,
-            outputs
-        )
-        if np.isfinite(score)
-    ]
+    results = []
+
+    for name, score in zip(
+        model.pathologies,
+        outputs
+    ):
+        if np.isfinite(score):
+            results.append({
+                "finding": name,
+                "score": float(score)
+            })
 
     results.sort(
         key=lambda item: item["score"],
@@ -129,55 +166,70 @@ def predict_xray(image):
 
 
 # ==========================================
-# 5. IMAGE VALIDATION
+# 6. IMAGE MANAGEMENT
 # ==========================================
 
-def validate_image(raw):
-    if len(raw) > MAX_FILE_SIZE:
-        raise ValueError(
-            "Image exceeds maximum size of 10 MB."
+def register_image(image, raw):
+    image_hash = hashlib.sha256(
+        raw
+    ).hexdigest()
+
+    previous_hash = st.session_state.image_hash
+    previous_id = st.session_state.image_id
+
+    # FIX: Generate ID when image changes
+    # OR when an older session has a missing ID.
+    is_new = (
+        image_hash != previous_hash
+        or previous_id is None
+        or st.session_state.xray_image is None
+    )
+
+    if is_new:
+        image_id = new_id()
+
+        st.session_state.xray_image = image
+        st.session_state.image_hash = image_hash
+        st.session_state.image_id = image_id
+
+        # Clear previous analysis and review
+        st.session_state.results = None
+        st.session_state.analysis_id = None
+        st.session_state.review = None
+
+        add_audit_log(
+            "IMAGE_UPLOADED",
+            {
+                "image_id": image_id,
+                "image_sha256": image_hash,
+                "size_bytes": len(raw),
+                "model": MODEL_ID
+            }
         )
 
-    if not raw:
-        raise ValueError("Empty image file.")
-
-    with Image.open(io.BytesIO(raw)) as source:
-        if source.format not in ("PNG", "JPEG"):
-            raise ValueError(
-                "Only PNG and JPEG images are supported."
-            )
-
-        if (
-            source.width > 5000
-            or source.height > 5000
-        ):
-            raise ValueError(
-                "Image dimensions are too large."
-            )
-
-        # Decode pixels and discard source metadata
-        image = source.convert("L")
-        image.load()
-
-    return image
+    return st.session_state.image_id
 
 
 # ==========================================
-# 6. MAIN UI
+# 7. MAIN INTERFACE
 # ==========================================
 
-st.title("🏥 Sovereign AI Medical Imaging System")
+st.title(
+    "🏥 Sovereign AI Medical Imaging System"
+)
 
 st.caption(
     "基於主權 AI 之胸部 X 光影像輔助分析系統"
 )
 
 st.warning(
-    "Educational research demonstration only. "
-    "AI outputs are not validated for clinical diagnosis."
+    "Educational demonstration only. "
+    "Not intended for clinical diagnosis."
 )
 
-st.sidebar.title("Sovereign AI Control Panel")
+st.sidebar.title(
+    "Sovereign AI Control Panel"
+)
 
 page = st.sidebar.radio(
     "Navigation",
@@ -192,12 +244,12 @@ page = st.sidebar.radio(
 )
 
 st.sidebar.divider()
-st.sidebar.caption("Environment: Streamlit Cloud CPU")
+st.sidebar.caption("Environment: Cloud CPU")
 st.sidebar.caption("Model: " + MODEL_ID)
 
 
 # ==========================================
-# 7. DASHBOARD
+# 8. DASHBOARD
 # ==========================================
 
 if page == "Dashboard":
@@ -205,33 +257,34 @@ if page == "Dashboard":
 
     col1, col2, col3 = st.columns(3)
 
-    col1.metric(
-        "AI Environment",
-        "Cloud CPU"
-    )
-
-    col2.metric(
-        "AI Model",
-        "DenseNet121"
-    )
-
+    col1.metric("AI Environment", "Cloud CPU")
+    col2.metric("AI Model", "DenseNet121")
     col3.metric(
         "Audit Events",
         len(st.session_state.audit_logs)
     )
 
-    st.subheader("Sovereign AI Controls")
+    st.subheader("Sovereign AI Status")
 
-    st.write(
-        "✅ AI inference runs inside the deployed application"
+    st.success(
+        "AI inference is available inside "
+        "the deployed application."
     )
 
     st.write(
-        "✅ Model identifier is explicitly configured"
+        "✅ X-ray image upload and validation"
     )
 
     st.write(
-        "✅ Human review workflow (demo)"
+        "✅ AI image analysis"
+    )
+
+    st.write(
+        "✅ Human decision workflow (demo)"
+    )
+
+    st.write(
+        "✅ Session-based audit logging"
     )
 
     st.write(
@@ -247,21 +300,22 @@ if page == "Dashboard":
     )
 
     st.info(
-        "The cloud infrastructure is operated by "
-        "a third-party provider. Full infrastructure "
-        "sovereignty is not claimed."
+        "Cloud infrastructure is managed by "
+        "a third-party provider. "
+        "Full infrastructure sovereignty "
+        "is not claimed."
     )
 
 
 # ==========================================
-# 8. UPLOAD X-RAY
+# 9. UPLOAD X-RAY
 # ==========================================
 
 elif page == "Upload X-ray":
     st.header("Upload Chest X-ray")
 
     st.info(
-        "Only upload public, de-identified "
+        "Use only public, de-identified "
         "educational test images."
     )
 
@@ -273,60 +327,56 @@ elif page == "Upload X-ray":
     if file is not None:
         try:
             raw = file.getvalue()
-
             image = validate_image(raw)
 
-            image_hash = hashlib.sha256(
+            image_id = register_image(
+                image,
                 raw
-            ).hexdigest()
-
-            # Reset analysis when a NEW image is uploaded
-            if image_hash != st.session_state.image_hash:
-                st.session_state.xray_image = image
-                st.session_state.image_hash = image_hash
-                st.session_state.image_id = str(
-                    uuid.uuid4()
-                )
-
-                st.session_state.results = None
-                st.session_state.analysis_id = None
-                st.session_state.review = None
-
-                add_audit_log(
-                    "IMAGE_UPLOADED",
-                    {
-                        "image_id":
-                            st.session_state.image_id,
-                        "image_sha256": image_hash,
-                        "size_bytes": len(raw)
-                    }
-                )
+            )
 
             st.image(
                 st.session_state.xray_image,
-                caption="X-ray Preview",
+                caption="Uploaded X-ray",
                 width=400
             )
 
             st.success(
-                "Image ready for AI analysis."
+                "Image ready for AI analysis!"
             )
 
+            st.write("Image ID:", image_id)
+
             st.caption(
-                "Image ID: "
-                + st.session_state.image_id
+                "SHA-256: "
+                + st.session_state.image_hash
             )
 
         except (
             UnidentifiedImageError,
             OSError,
-            ValueError
+            ValueError,
+            Image.DecompressionBombError
         ) as exc:
-            st.error(f"Upload failed: {exc}")
+            st.error(
+                f"Upload failed: {exc}"
+            )
+
+    elif st.session_state.xray_image is not None:
+        st.subheader("Current Session Image")
+
+        st.image(
+            st.session_state.xray_image,
+            width=350
+        )
+
+        st.write(
+            "Image ID:",
+            st.session_state.image_id
+        )
 
 
 # ==========================================
-# 9. AI ANALYSIS
+# 10. AI ANALYSIS
 # ==========================================
 
 elif page == "AI Analysis":
@@ -341,6 +391,11 @@ elif page == "AI Analysis":
         st.image(
             st.session_state.xray_image,
             width=350
+        )
+
+        st.write(
+            "Image ID:",
+            st.session_state.image_id
         )
 
         st.write(
@@ -360,7 +415,14 @@ elif page == "AI Analysis":
                         st.session_state.xray_image
                     )
 
-                analysis_id = str(uuid.uuid4())
+                # Ensure image ID exists
+                if st.session_state.image_id is None:
+                    raise ValueError(
+                        "Image ID is missing. "
+                        "Please upload the image again."
+                    )
+
+                analysis_id = new_id()
 
                 st.session_state.results = prediction
                 st.session_state.analysis_id = analysis_id
@@ -380,21 +442,23 @@ elif page == "AI Analysis":
                 )
 
                 st.success(
-                    "AI inference completed successfully!"
+                    "AI inference completed!"
                 )
 
             except Exception as exc:
                 st.error(
-                    "AI model could not run."
+                    "AI inference failed."
                 )
                 st.exception(exc)
 
         if st.session_state.results is not None:
+            st.divider()
+
             st.subheader("AI Model Output Scores")
 
             st.caption(
-                "These are model output scores, "
-                "not calibrated disease probabilities."
+                "Scores are not calibrated disease "
+                "probabilities or clinical diagnoses."
             )
 
             st.write(
@@ -404,26 +468,26 @@ elif page == "AI Analysis":
 
             st.dataframe(
                 st.session_state.results,
-                use_container_width=True,
-                hide_index=True
+                hide_index=True,
+                use_container_width=True
             )
 
             st.info(
-                "A qualified clinician must independently "
-                "review the model outputs."
+                "AI outputs require independent "
+                "review by a qualified clinician."
             )
 
 
 # ==========================================
-# 10. DOCTOR REVIEW
+# 11. DOCTOR REVIEW
 # ==========================================
 
 elif page == "Doctor Review":
     st.header("Doctor Review – 醫師審查")
 
     st.warning(
-        "Demonstration workflow only. "
-        "Reviewer identity is not authenticated."
+        "Demonstration only. Reviewer identity "
+        "is not authenticated."
     )
 
     if st.session_state.results is None:
@@ -432,27 +496,33 @@ elif page == "Doctor Review":
         )
 
     else:
-        st.subheader("Patient Image – Demo")
+        st.subheader("X-ray Image")
 
         st.image(
             st.session_state.xray_image,
             width=350
         )
 
-        st.subheader("AI Results")
+        st.write(
+            "Image ID:",
+            st.session_state.image_id
+        )
 
         st.write(
             "Analysis ID:",
             st.session_state.analysis_id
         )
 
+        st.subheader("AI Results")
+
         st.dataframe(
             st.session_state.results,
-            use_container_width=True,
-            hide_index=True
+            hide_index=True,
+            use_container_width=True
         )
 
         st.divider()
+
         st.subheader("Human Decision Control")
 
         with st.form("doctor_review_form"):
@@ -489,9 +559,15 @@ elif page == "Doctor Review":
                     "Please enter review notes."
                 )
 
+            elif st.session_state.image_id is None:
+                st.error(
+                    "Image ID is missing. "
+                    "Please upload the image again."
+                )
+
             else:
                 record = {
-                    "review_id": str(uuid.uuid4()),
+                    "review_id": new_id(),
                     "analysis_id":
                         st.session_state.analysis_id,
                     "image_id":
@@ -515,55 +591,66 @@ elif page == "Doctor Review":
                 )
 
         if st.session_state.review is not None:
+            st.divider()
+
             st.subheader("Latest Review")
 
             st.json(
                 st.session_state.review
             )
 
+            st.download_button(
+                "Download Review JSON",
+                data=json.dumps(
+                    st.session_state.review,
+                    ensure_ascii=False,
+                    indent=2
+                ),
+                file_name="doctor_review.json",
+                mime="application/json"
+            )
+
 
 # ==========================================
-# 11. MODEL CONTROL
+# 12. MODEL CONTROL
 # ==========================================
 
 elif page == "Model Control":
     st.header("Model Management")
 
-    st.write(
-        "Model Name: DenseNet121"
-    )
-
-    st.write(
-        "Model ID:",
-        MODEL_ID
-    )
-
-    st.write(
-        "Execution Environment: Cloud CPU"
-    )
+    st.write("Model Name: DenseNet121")
+    st.write("Model ID:", MODEL_ID)
 
     st.write(
         "Framework: PyTorch / TorchXRayVision"
     )
 
+    st.write(
+        "Execution Environment: Streamlit Cloud CPU"
+    )
+
+    st.write(
+        "Weights source: TorchXRayVision pretrained model"
+    )
+
     st.warning(
-        "Model checksum verification, "
-        "version approval and authorized model "
-        "switching are not implemented yet."
+        "Model weight checksum, approval registry "
+        "and authorized model switching "
+        "are not implemented yet."
     )
 
 
 # ==========================================
-# 12. AUDIT LOG
+# 13. AUDIT LOG
 # ==========================================
 
 elif page == "Audit Log":
     st.header("Audit Log – 稽核紀錄")
 
     st.warning(
-        "Session-only audit history. "
-        "Logs may be lost when the session ends. "
-        "This is not a tamper-proof audit system."
+        "Session-only audit records. "
+        "Events may disappear when the session ends. "
+        "This is not tamper-proof storage."
     )
 
     logs = st.session_state.audit_logs
@@ -574,28 +661,39 @@ elif page == "Audit Log":
     )
 
     if logs:
-        summary = [
-            {
+        summary = []
+
+        for event in reversed(logs):
+            details = event.get("details", {})
+
+            summary.append({
                 "timestamp": event["timestamp"],
                 "action": event["action"],
+                "image_id": details.get(
+                    "image_id", ""
+                ),
+                "analysis_id": details.get(
+                    "analysis_id", ""
+                ),
                 "event_id": event["event_id"]
-            }
-            for event in reversed(logs)
-        ]
+            })
 
         st.dataframe(
             summary,
-            use_container_width=True,
-            hide_index=True
+            hide_index=True,
+            use_container_width=True
         )
 
         st.subheader("Event Details")
 
         for event in reversed(logs):
-            with st.expander(
-                f"{event['timestamp']} | "
-                f"{event['action']}"
-            ):
+            title = (
+                event["timestamp"]
+                + " | "
+                + event["action"]
+            )
+
+            with st.expander(title):
                 st.json(event)
 
         json_data = json.dumps(
@@ -613,5 +711,6 @@ elif page == "Audit Log":
 
     else:
         st.info(
-            "No audit events recorded in this session."
+            "No audit events recorded "
+            "in this session."
         )
